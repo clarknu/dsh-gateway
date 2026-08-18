@@ -211,6 +211,39 @@ test('unknown Host header is refused with 421', async () => {
   })
 })
 
+test('wildcard host entries match subdomains only', async () => {
+  await withGateway({ sites: [{ hosts: ['*.clarknu.net'] }] }, async ({ port }) => {
+    assert.equal((await request(port, { host: 'fnzh.clarknu.net', servername: 'fnzh.clarknu.net', path: '/' })).status, 302)
+    assert.equal((await request(port, { host: 'a.b.clarknu.net', servername: 'a.b.clarknu.net', path: '/' })).status, 302)
+    assert.equal((await request(port, { host: 'clarknu.net', servername: 'clarknu.net', path: '/' })).status, 421)
+  })
+})
+
+test('an empty site list accepts every Host (permissive mode)', async () => {
+  await withGateway({ sites: [] }, async ({ port }) => {
+    const res = await request(port, { host: 'anything.test', servername: 'anything.test', path: '/' })
+    assert.equal(res.status, 302)
+  })
+})
+
+test('unsupported methods on /login are refused with 405', async () => {
+  await withGateway({}, async ({ port }) => {
+    const res = await request(port, { method: 'PUT', path: '/login' })
+    assert.equal(res.status, 405)
+    assert.match(res.headers.allow, /GET/)
+  })
+})
+
+test('HEAD requests proxy without a body', async () => {
+  await withGateway({}, async ({ port }) => {
+    const login = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=secret-pass' })
+    const cookie = cookieOf(login.setCookies)
+    const res = await request(port, { method: 'HEAD', path: '/', headers: { cookie } })
+    assert.equal(res.status, 200)
+    assert.equal(res.body, '')
+  })
+})
+
 test('unauthenticated WebSocket upgrade is refused', async () => {
   await withGateway({}, async ({ port }) => {
     const res = await request(port, {
