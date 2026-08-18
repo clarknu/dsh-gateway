@@ -1,8 +1,8 @@
-# Post-publish smoke test: the exact flow a third party runs.
-#   dsh plugin --profile <name> add dsh-gateway   (from the npm registry)
-# then boot and curl the gateway. Run: node scripts/postpublish-smoke.mjs
+// Post-publish smoke test: the exact flow a third party runs.
+//   dsh plugin --profile <name> add dsh-gateway   (from the npm registry)
+// then boot and curl the gateway. Run: node scripts/postpublish-smoke.mjs
 import { execFileSync } from 'node:child_process'
-import { writeFileSync, rmSync, existsSync } from 'node:fs'
+import { writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -12,7 +12,8 @@ const profileDir = join(DSH, 'profiles', PROFILE)
 
 const run = (cmd, args, opts = {}) => {
   console.log(`$ ${cmd} ${args.join(' ')}`)
-  return execFileSync(cmd, args, { stdio: 'inherit', ...opts })
+  // dsh is a .cmd shim on Windows; a shell resolves it.
+  return execFileSync(cmd, args, { stdio: 'inherit', shell: process.platform === 'win32', ...opts })
 }
 
 // 1) fresh profile with the plugin straight from the npm registry
@@ -36,7 +37,7 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), patch, 'utf8')
 // 3) add the web surface from the local installation (npm's dsh-web-app is a
 //    stale rc.1; the running installation resolves the in-box rc.6 instead)
 const manifest = join(profileDir, 'package.json')
-const pkg = JSON.parse(require('node:fs').readFileSync(manifest, 'utf8'))
+const pkg = JSON.parse(readFileSync(manifest, 'utf8'))
 pkg.dsh.profile.bundles.splice(1, 0, '@deepseek-ai/dsh-web-app')
 writeFileSync(manifest, JSON.stringify(pkg, null, 2) + '\n', 'utf8')
 
