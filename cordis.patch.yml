@@ -1,0 +1,12 @@
+# dsh-gateway bundle patch: mounts the HTTPS remote-access gateway row.
+#
+# The row injects the webServer service (the web surface's HTTP carrier); the
+# plugin resolves the real bound port at runtime, so profiles never restate
+# the upstream in a config override. A profile without a webServer row
+# (headless/TUI) never activates the gateway. Every behavior is overridable
+# through the `gateway:` settings namespace (settings.yaml or the web
+# Settings page) — see README for the full schema.
+- insert:
+    - id: gateway
+      name: 'dsh-gateway'
+      inject: ['webServer']
