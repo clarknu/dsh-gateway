@@ -198,7 +198,7 @@ function Build-Menu {
   $menu.ShowImageMargin = $false
   $first = $true
   foreach ($inst in (Get-Instances)) {
-    if (-not $first) { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
+    if (-not $first) { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
     $first = $false
     $s = Instance-State $inst
     $webUp = $s.webUp
