@@ -459,6 +459,11 @@ internal static class Program
 
     private static Icon MakeIcon()
     {
+        // Prefer the multi-resolution icon embedded in this exe, so the tray
+        // icon and the program icon are the same asset. Fall back to a
+        // runtime-drawn one only if extraction fails.
+        var embedded = Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+        if (embedded != null) return embedded;
         // The bitmap must outlive the Icon: Icon.FromHandle wraps the hicon,
         // which dies with its bitmap, so disposing the bitmap here would leave
         // a valid-looking-but-invisible tray icon. One 16x16 leak is fine.

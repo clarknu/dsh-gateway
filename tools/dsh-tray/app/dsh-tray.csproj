@@ -9,6 +9,7 @@
     <RootNamespace>DshTray</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\dsh-tray.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="10.0.0" />
