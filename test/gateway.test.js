@@ -18,7 +18,7 @@ function makeUpstream() {
   const upstream = createHttpServer((req, res) => {
     if (req.url.startsWith('/api/echo')) {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ url: req.url, xfp: req.headers['x-forwarded-proto'] ?? null, host: req.headers.host }))
+      res.end(JSON.stringify({ url: req.url, xfp: req.headers['x-forwarded-proto'] ?? null, host: req.headers.host ?? null, origin: req.headers.origin ?? null }))
       return
     }
     res.writeHead(200, { 'content-type': 'text/plain' })
@@ -160,7 +160,27 @@ test('successful login issues an HttpOnly Secure session cookie that authorizes 
     assert.equal(api.status, 200)
     const json = JSON.parse(api.body)
     assert.equal(json.xfp, 'https')
-    assert.equal(json.host, `127.0.0.1:${upstreamPort}`) // upstream Host header was rewritten
+    assert.equal(json.host, 'localhost') // the client's Host is preserved, Caddy-style
+  })
+})
+
+test('Host and Origin are preserved so the dsh trust fence passes (regression)', async () => {
+  await withGateway({}, async ({ port }) => {
+    const login = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=secret-pass' })
+    const cookie = cookieOf(login.setCookies)
+    // A browser POST to https://localhost:3443 sends both headers like this;
+    // the dsh API trust fence rejects when Origin.host !== Host.host.
+    const api = await request(port, {
+      method: 'POST',
+      path: '/api/echo',
+      host: 'localhost:3453',
+      headers: { cookie, origin: 'https://localhost:3453', 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(api.status, 200)
+    const json = JSON.parse(api.body)
+    assert.equal(json.host, 'localhost:3453')
+    assert.equal(json.origin, 'https://localhost:3453')
   })
 })
 
