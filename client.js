@@ -233,6 +233,7 @@ window.__ModuleLoader__.load({
             ),
           )
           rows.push(h('div', { key: 'd5', style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,0.8))', paddingTop: 8 } }, t.settingsHint))
+          body = rows
         }
 
         return h(
