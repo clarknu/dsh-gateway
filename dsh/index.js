@@ -3,6 +3,9 @@
 // lifecycle, and hot reload: every committed settings change rebuilds the
 // listener, swapping in the new server only after it binds successfully so a
 // bad edit never drops the gate that is already up.
+//
+// Also mounts the `/gateway/panel` route (status, logs, restart, config
+// patches) consumed by the Settings-page card in ./client.js.
 
 import z from '@deepseek-ai/schemastery'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -36,8 +39,7 @@ export const Config = z.object({
     .default([{ hosts: ['localhost'], cert: '', key: '' }]),
 })
 
-const log = (msg) => console.log(msg)
-const warn = (msg) => console.error(msg)
+const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 
 /** $DSH_HOME/gateway — certs and the persistent signing secret live here. */
 function gatewayDataDir() {
@@ -52,7 +54,7 @@ function loadHmacSecret(dataDir) {
       const state = JSON.parse(readFileSync(statePath, 'utf8'))
       if (typeof state.hmacSecret === 'string' && state.hmacSecret.length >= 32) return state.hmacSecret
     } catch {
-      warn(`gateway: unreadable state file ${statePath} — regenerating`)
+      console.error(`gateway: unreadable state file ${statePath} — regenerating`)
     }
   }
   const secret = randomBytes(32).toString('base64')
@@ -62,17 +64,26 @@ function loadHmacSecret(dataDir) {
 }
 
 export function apply(ctx, config = {}) {
-  if (config.enabled === false) {
-    log('gateway: disabled (gateway.enabled = false)')
-    return
-  }
-
   const dataDir = gatewayDataDir()
   const hmacSecret = loadHmacSecret(dataDir)
+
+  // Ring buffer for the panel's log view (and plain console output).
+  const logLines = []
+  const pushLog = (level, msg) => {
+    const line = { t: new Date().toISOString(), level, msg: String(msg) }
+    logLines.push(line)
+    if (logLines.length > 200) logLines.shift()
+    ;(level === 'warn' ? console.error : console.log)(msg)
+  }
+  const log = (msg) => pushLog('info', msg)
+  const warn = (msg) => pushLog('warn', msg)
+
   let settingsScope = null
   let current = null
   let currentOptions = null
   let rebuildChain = Promise.resolve()
+  let startedAt = null
+  let lastError = ''
 
   const resolvedConfig = () => (settingsScope ? settingsScope.get() : config)
 
@@ -89,15 +100,16 @@ export function apply(ctx, config = {}) {
     return 'http://127.0.0.1:3080'
   }
 
-  const queueRebuild = () => {
+  const queueRebuild = (force = false) => {
     rebuildChain = rebuildChain
       .then(async () => {
         const cfg = resolvedConfig()
         if (cfg.enabled === false) {
+          if (current) log('gateway: disabled — listener stopped')
           current?.stop()
           current = null
           currentOptions = null
-          log('gateway: disabled')
+          startedAt = null
           return
         }
         const options = {
@@ -117,7 +129,7 @@ export function apply(ctx, config = {}) {
           log,
           warn,
         }
-        if (current) {
+        if (current && !force) {
           // Two-tier hot reload: request-time fields mutate in place (no gap,
           // sessions survive); listener-affecting fields restart the server.
           const restartNeeded =
@@ -130,20 +142,27 @@ export function apply(ctx, config = {}) {
             currentOptions.sites = options.sites
             return
           }
-          const previous = current
-          current = null
-          currentOptions = null
-          previous.stop()
           log('gateway: listener settings changed — restarting')
         }
+        // A listener swap tears down the very connection that requested it
+        // (panel restart / port change). Give the in-flight response a beat
+        // to flush before closing the old server.
+        if (current) await new Promise((resolve) => setTimeout(resolve, 120))
+        current?.stop()
+        current = null
+        currentOptions = null
+        startedAt = null
+        lastError = ''
         try {
           const next = createGateway(options)
           const port = await next.start()
           current = next
           currentOptions = options
+          startedAt = new Date().toISOString()
           bootWarnings(cfg, port)
         } catch (error) {
-          warn(`gateway: failed to apply configuration, gateway is down — ${error.message}`)
+          lastError = error.message ?? String(error)
+          warn(`gateway: failed to apply configuration, gateway is down — ${lastError}`)
         }
       })
       .catch(() => {}) // a contained rebuild never poisons the chain
@@ -161,6 +180,93 @@ export function apply(ctx, config = {}) {
     if (hosts.length === 0 || (hosts.length === 1 && hosts[0] === 'localhost')) {
       warn(`gateway: listening on port ${port} but no public hostname is configured — add gateway.sites[].hosts (e.g. your domain) before exposing it`)
     }
+  }
+
+  // ── Settings-page panel route (consumed by ./client.js) ──────────────────
+  const panelStatus = () => {
+    const cfg = resolvedConfig()
+    return {
+      version,
+      enabled: cfg.enabled !== false,
+      running: current !== null,
+      startedAt,
+      lastError,
+      listenHost: cfg.listenHost,
+      port: current?.port ?? cfg.port,
+      upstream: current ? currentOptions?.upstream : resolveUpstream(cfg),
+      cookieName: cfg.cookieName,
+      sessionDays: cfg.sessionDays,
+      loginFailLimit: cfg.loginFailLimit,
+      lockoutSeconds: cfg.lockoutSeconds,
+      title: cfg.title,
+      users: Object.fromEntries(Object.keys(cfg.users ?? {}).map((u) => [u, '\u2022\u2022\u2022\u2022'])),
+      sites: (cfg.sites ?? []).map((s) => ({ hosts: s.hosts ?? [], cert: s.cert ? 'file' : 'auto' })),
+    }
+  }
+
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (scope) => {
+      const dispose = scope.webServer.register({
+        kind: 'prefix',
+        path: '/gateway/panel',
+        handler: (req, res) => {
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          if (req.method === 'GET') {
+            res.writeHead(200)
+            res.end(JSON.stringify({ ...panelStatus(), logs: logLines.slice(-100) }))
+            return
+          }
+          if (req.method === 'POST') {
+            let raw = ''
+            req.on('data', (chunk) => {
+              raw += chunk
+              if (raw.length > 65536) req.destroy()
+            })
+            return req.on('end', async () => {
+              let body
+              try {
+                body = JSON.parse(raw || '{}')
+              } catch {
+                res.writeHead(400)
+                return res.end(JSON.stringify({ ok: false, error: 'bad json' }))
+              }
+              try {
+                if (body.action === 'restart') {
+                  // Respond first: the rebuild tears down the listener that is
+                  // serving this very request, so the reply must be out the
+                  // door before the swap starts.
+                  res.writeHead(200)
+                  res.end(JSON.stringify({ ok: true, action: 'restart', ...panelStatus() }))
+                  setTimeout(() => void queueRebuild(true), 50)
+                  return
+                }
+                if (body.action === 'update') {
+                  if (!settingsScope) {
+                    res.writeHead(400)
+                    return res.end(JSON.stringify({ ok: false, error: 'settings unavailable — edit settings.yaml directly' }))
+                  }
+                  // Persist + validate; the settings watch queues the rebuild
+                  // (its listener swap waits 120ms, letting this reply flush).
+                  await settingsScope.update(body.patch ?? {})
+                  res.writeHead(200)
+                  res.end(JSON.stringify({ ok: true, ...panelStatus() }))
+                  return
+                }
+                res.writeHead(400)
+                return res.end(JSON.stringify({ ok: false, error: `unknown action ${JSON.stringify(body.action)}` }))
+              } catch (error) {
+                res.writeHead(400)
+                res.end(JSON.stringify({ ok: false, error: error.message ?? String(error) }))
+              }
+            })
+          }
+          res.writeHead(405, { allow: 'GET, POST' })
+          res.end(JSON.stringify({ ok: false, error: 'method not allowed' }))
+        },
+      })
+      ctx.on('dispose', dispose)
+    })
   }
 
   if (typeof ctx.inject === 'function') {
