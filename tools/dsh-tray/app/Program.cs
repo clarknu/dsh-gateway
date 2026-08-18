@@ -37,6 +37,7 @@ internal static class Program
     {
         Directory.CreateDirectory(LogDir);
         _instances = LoadConfig();
+        Log($"tray started (pid {Environment.ProcessId}, {_instances.Count} instance(s))");
 
         ApplicationConfiguration.Initialize();
         using var context = new ApplicationContext();
@@ -311,7 +312,10 @@ internal static class Program
 
     private static Icon MakeIcon()
     {
-        using var bmp = new Bitmap(16, 16);
+        // The bitmap must outlive the Icon: Icon.FromHandle wraps the hicon,
+        // which dies with its bitmap, so disposing the bitmap here would leave
+        // a valid-looking-but-invisible tray icon. One 16x16 leak is fine.
+        var bmp = new Bitmap(16, 16);
         using (var g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
