@@ -1,3 +1,3 @@
 @echo off
-rem dsh-tray 双击启动器：以隐藏窗口方式拉起托盘（无黑窗口）
-start "" pwsh -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0dsh-tray.ps1"
+rem dsh-tray 启动器：启动编译版托盘程序（无窗口，常驻通知区域）
+start "" "%~dp0app\out\dsh-tray.exe"

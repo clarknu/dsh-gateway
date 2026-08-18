@@ -62,13 +62,13 @@ gateway:
 
 ## Windows 托盘启动器（可选）
 
-`tools/dsh-tray/` 附带一个系统托盘常驻控制器，用于隐藏 DSH 命令行窗口并以菜单方式管理实例：
+`tools/dsh-tray/` 附带一个原生 .NET WinForms 托盘控制器，用于隐藏 DSH 命令行窗口并以菜单方式管理实例：
 
-- 双击 `start-tray.cmd` 启动（无黑窗口，常驻通知区域）
+- 构建（需 .NET SDK 10+）：`dotnet publish tools/dsh-tray/app/dsh-tray.csproj -c Release -o tools/dsh-tray/app/out`
+- 双击 `start-tray.cmd` 启动（无窗口，常驻通知区域，蓝色圆形 G 图标）
 - 右键菜单：每个实例一组「打开页面 / 打开网关 / 启动 / 重启 / 停止」，端口探测实时显示运行状态
 - 实例异常退出弹气泡通知并显示日志尾部；菜单内可勾选「开机自启」
-- 配置：复制 `config.example.json` 为 `config.json`，按实例填写（name/profile/webUrl/gatewayUrl）
-- 自检命令：`pwsh -File dsh-tray.ps1 -TestStart <profile>` / `-TestStop` / `-TestPort`
+- 配置：复制 `config.example.json` 为 `config.json` 放到 exe 同目录，按实例填写（name/profile/webUrl/gatewayUrl）
 
 ## 安全基线（部署前必读）
 
