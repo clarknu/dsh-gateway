@@ -8,6 +8,7 @@
     <AssemblyName>dsh-tray</AssemblyName>
     <RootNamespace>DshTray</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="10.0.0" />
