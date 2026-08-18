@@ -1,3 +1,3 @@
 @echo off
-rem dsh-tray 启动器：启动编译版托盘程序（无窗口，常驻通知区域）
+rem dsh-tray launcher: run the compiled tray app (no console window)
 start "" "%~dp0app\out\dsh-tray.exe"
