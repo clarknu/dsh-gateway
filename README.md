@@ -47,6 +47,29 @@ gateway:
 - 公网域名请提供 CA 签发的 `cert`/`key` 路径；局域网 IP 可留空用自签（浏览器首次访问需手动信任）
 - `upstream` 留空时插件从注入的 `webServer` 服务读取真实端口，改 `dsh web --port` 无需再动网关配置
 
+## 设置页配置面板（Web UI）
+
+安装后，DSH 设置页会出现一张 **Remote Gateway** 卡片（通过 `settings.plugin.item` 插槽注册），提供：
+
+- **状态摘要**：运行中/已停用、对外端口、上游地址、启动时间
+- **启用 / 停用**：停用前弹确认（停用会切断远程连接，需本机 settings.yaml 恢复）
+- **端口修改**：输入新端口应用 → 校验 → 持久化 → 监听自动重启
+- **重启网关**：一键重建监听（先响应、后换监听，点击不会报错）
+- **实时日志**：最近 40 条（每 3 秒自动刷新，警告橙色标注）
+- 复杂配置（账号、证书、多站点等）仍走 settings.yaml 的 `gateway:` 段
+
+卡片的所有操作与手改 settings.yaml 完全等价：同样经 schema 校验、持久化、热生效。
+
+## Windows 托盘启动器（可选）
+
+`tools/dsh-tray/` 附带一个系统托盘常驻控制器，用于隐藏 DSH 命令行窗口并以菜单方式管理实例：
+
+- 双击 `start-tray.cmd` 启动（无黑窗口，常驻通知区域）
+- 右键菜单：每个实例一组「打开页面 / 打开网关 / 启动 / 重启 / 停止」，端口探测实时显示运行状态
+- 实例异常退出弹气泡通知并显示日志尾部；菜单内可勾选「开机自启」
+- 配置：复制 `config.example.json` 为 `config.json`，按实例填写（name/profile/webUrl/gatewayUrl）
+- 自检命令：`pwsh -File dsh-tray.ps1 -TestStart <profile>` / `-TestStop` / `-TestPort`
+
 ## 安全基线（部署前必读）
 
 1. **改默认密码**：`gateway.users` 里不要保留 `admin/change-me`

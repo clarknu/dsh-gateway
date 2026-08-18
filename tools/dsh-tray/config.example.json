@@ -1,0 +1,12 @@
+{
+  "instances": [
+    {
+      "name": "web（默认生产实例）",
+      "profile": "web",
+      "args": [],
+      "webUrl": "http://127.0.0.1:3080",
+      "gatewayUrl": "https://your-domain.example:3443",
+      "startOnBoot": false
+    }
+  ]
+}
