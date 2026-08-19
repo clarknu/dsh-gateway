@@ -1,0 +1,24 @@
+{
+  "instances": [
+    {
+      "name": "web（生产）",
+      "profile": "web",
+      "args": [],
+      "webUrl": "http://127.0.0.1:3080",
+      "gatewayUrl": "https://fnzh.clarknu.net:53443",
+      "startOnBoot": false,
+      "monitorGateway": true,
+      "autoRestartGateway": true
+    },
+    {
+      "name": "gwlab（实验）",
+      "profile": "gwlab",
+      "args": [],
+      "webUrl": "http://127.0.0.1:3090",
+      "gatewayUrl": "https://localhost:3453",
+      "startOnBoot": false,
+      "monitorGateway": false,
+      "autoRestartGateway": true
+    }
+  ]
+}

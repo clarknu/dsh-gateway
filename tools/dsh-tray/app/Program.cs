@@ -19,6 +19,8 @@ internal sealed class InstanceConfig
     public string WebUrl { get; set; } = "";
     public string? GatewayUrl { get; set; }
     public bool StartOnBoot { get; set; }
+    public bool MonitorGateway { get; set; }
+    public bool AutoRestartGateway { get; set; } = true;
 }
 
 internal static class Program
@@ -31,6 +33,7 @@ internal static class Program
     private static NotifyIcon? _tray;
     private static readonly Dictionary<string, bool> StartedByUs = new();
     private static readonly Dictionary<string, string> LastState = new();
+    private static readonly Dictionary<string, string> LastGwState = new();
 
     // 状态缓存：UI 线程只读缓存，后台线程刷新（原生端口表毫秒级，无 WMI）
     private static readonly object CacheLock = new();
@@ -101,6 +104,8 @@ internal static class Program
                     WebUrl = Get(el, "webUrl"),
                     GatewayUrl = el.TryGetProperty("gatewayUrl", out var g) && g.ValueKind == JsonValueKind.String ? g.GetString() : null,
                     StartOnBoot = el.TryGetProperty("startOnBoot", out var s) && s.ValueKind == JsonValueKind.True,
+                    MonitorGateway = el.TryGetProperty("monitorGateway", out var m) && m.ValueKind == JsonValueKind.True,
+                    AutoRestartGateway = !el.TryGetProperty("autoRestartGateway", out var a2) || a2.ValueKind != JsonValueKind.False,
                 }).ToList();
         }
         catch (Exception ex)
@@ -347,6 +352,25 @@ internal static class Program
         return true;
     }
 
+    // 通过面板接口让网关插件自重建（仅插件级重启，不动 dsh 进程），后台执行避免卡 UI。
+    // 面板路由 /gateway/panel 由网关插件注册在 web 服务器上，回环访问无需认证。
+    private static async Task TryRestartGateway(InstanceConfig inst)
+    {
+        try
+        {
+            var url = inst.WebUrl.TrimEnd('/') + "/gateway/panel";
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var content = new StringContent("{\"action\":\"restart\"}", System.Text.Encoding.UTF8, "application/json");
+            var resp = await client.PostAsync(url, content);
+            var text = (await resp.Content.ReadAsStringAsync()).Trim();
+            Log($"gateway restart {inst.Profile}: HTTP {(int)resp.StatusCode} {text[..Math.Min(120, text.Length)]}");
+        }
+        catch (Exception ex)
+        {
+            Log($"gateway restart {inst.Profile} failed: {ex.Message}");
+        }
+    }
+
     // ── menu ────────────────────────────────────────────────────────────────
 
     private static ContextMenuStrip BuildMenu()
@@ -447,7 +471,7 @@ internal static class Program
     {
         foreach (var inst in _instances)
         {
-            var (webUp, _) = StateOf(inst);
+            var (webUp, gwUp) = StateOf(inst);
             var prev = LastState.GetValueOrDefault(inst.Profile);
             var byUs = StartedByUs.GetValueOrDefault(inst.Profile);
             if (prev == "down" && webUp && byUs)
@@ -461,6 +485,22 @@ internal static class Program
                 _tray?.ShowBalloonTip(5000, "dsh-tray", $"{inst.Name} 异常退出{tail}", ToolTipIcon.Warning);
             }
             LastState[inst.Profile] = webUp ? "up" : "down";
+
+            // 网关端口监控（按实例开关）：网关掉线但 web 还活着时提示，可选自动恢复。
+            // 插件本身也有 60s 自愈，这里是第二层保险（web 在面板接口才可用）。
+            if (inst.GatewayUrl != null && inst.MonitorGateway)
+            {
+                var prevGw = LastGwState.GetValueOrDefault(inst.Profile);
+                if (prevGw == "up" && !gwUp)
+                {
+                    Log($"gateway {inst.Profile} went down (webUp={webUp}, gwPort={PortOf(inst.GatewayUrl)})");
+                    _tray?.ShowBalloonTip(5000, "dsh-tray", $"{inst.Name} 网关掉线（:{PortOf(inst.GatewayUrl)}）" +
+                        (inst.AutoRestartGateway && webUp ? "，正在尝试自动恢复…" : "。"), ToolTipIcon.Warning);
+                    if (inst.AutoRestartGateway && webUp)
+                        _ = TryRestartGateway(inst);
+                }
+                LastGwState[inst.Profile] = gwUp ? "up" : "down";
+            }
         }
 
         // 状态变化时自动重建菜单（展开中不打断，收起后下次 tick 即更新）——不用反复点击也能看到最新状态
