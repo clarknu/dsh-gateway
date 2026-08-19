@@ -282,7 +282,10 @@ window.__ModuleLoader__.load({
       var react = require('react')
       var Card = GatewayCard(react)
       ctx.slots.inject('settings.plugin.item', function* () {
-        yield ctx.slots.register({ name: 'settings.plugin.item', id: 'gateway', order: 30 }, Card)
+        // id for list-kind slots (dsh rc.6), key for keyed-kind slots (rc.7):
+        // settings.plugin.item changed declaration kind between versions, and a
+        // keyed slot throws without options.key — passing both stays compatible.
+        yield ctx.slots.register({ name: 'settings.plugin.item', id: 'gateway', key: 'gateway', order: 30 }, Card)
       })
     }
 
