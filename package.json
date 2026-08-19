@@ -1,6 +1,6 @@
 {
   "name": "dsh-gateway",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "description": "Self-contained HTTPS remote-access gateway for the DeepSeek Harness web surface: cookie-session login, SNI multi-cert/self-signed TLS, and a WebSocket-capable reverse proxy — the Caddy layer as a dsh plugin.",
   "type": "module",
   "main": "dsh/index.js",

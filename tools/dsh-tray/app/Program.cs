@@ -4,10 +4,9 @@
 
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
-using System.Management;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace DshTray;
@@ -33,10 +32,11 @@ internal static class Program
     private static readonly Dictionary<string, bool> StartedByUs = new();
     private static readonly Dictionary<string, string> LastState = new();
 
-    // 状态缓存：UI 线程只读缓存，后台线程刷新（避免 WMI/端口探测卡 UI）
+    // 状态缓存：UI 线程只读缓存，后台线程刷新（原生端口表毫秒级，无 WMI）
     private static readonly object CacheLock = new();
     private static readonly Dictionary<string, (bool webUp, bool gwUp, List<int> pids)> StateCache = new();
-    private static HashSet<int> _listeningPorts = new();
+    private static string _menuSig = "";   // 上次重建菜单时的状态签名（变化才重建）
+    private static bool _menuOpen;         // 菜单是否展开（展开时不重建，避免打断）
 
     [STAThread]
     private static void Main(string[] args)
@@ -57,9 +57,14 @@ internal static class Program
             Visible = true,
             ContextMenuStrip = BuildMenu(),
         };
+        _menuSig = MenuSig();
         _tray.MouseUp += (_, e) =>
         {
-            if (e.Button == MouseButtons.Right) _tray.ContextMenuStrip = BuildMenu();
+            if (e.Button == MouseButtons.Right)
+            {
+                RefreshCache(); // 原生端口表毫秒级：点右键即读到最新状态
+                _tray.ContextMenuStrip = BuildMenu();
+            }
         };
 
         if (_instances.Any(i => i.StartOnBoot))
@@ -125,42 +130,80 @@ internal static class Program
         catch { return false; }
     }
 
-    // 监听端口集合（后台刷新缓存，O(1) 判断）
-    private static bool PortInCache(int port) { lock (CacheLock) return _listeningPorts.Contains(port); }
+    // 原生端口表（一次调用拿全量监听端口 + 所属 PID，毫秒级，替代三套 WMI 查询）
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder,
+        int ulAf, int tableClass, int reserved);
 
-    // 后台刷新：一次查全量监听端口 + 每个实例的 pids，写入缓存。
-    // 注意：WMI 查询在锁外完成（约 1s），锁内只做字典赋值，避免阻塞 UI 线程读缓存
+    private static int NetPort(uint v) => ((int)(v & 0xFF) << 8) | (int)((v >> 8) & 0xFF);
+
+    private static (HashSet<int> ports, Dictionary<int, List<int>> pidByPort) GetTcpListeners()
+    {
+        var ports = new HashSet<int>();
+        var pidByPort = new Dictionary<int, List<int>>();
+        foreach (var af in new[] { 2, 23 }) // AF_INET / AF_INET6
+        {
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, 3, 0); // TCP_TABLE_OWNER_PID_LISTENER=3
+            if (size <= 0) continue;
+            var buf = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (GetExtendedTcpTable(buf, ref size, false, af, 3, 0) != 0) continue;
+                int count = Marshal.ReadInt32(buf);
+                int off = 4;
+                int portOff = af == 2 ? 8 : 20;  // 行内 local port 偏移
+                int pidOff = af == 2 ? 20 : 44;  // 行内 owning pid 偏移
+                int rowSize = af == 2 ? 24 : 48;
+                for (int i = 0; i < count; i++)
+                {
+                    int port = NetPort((uint)Marshal.ReadInt32(buf, off + portOff));
+                    int pid = Marshal.ReadInt32(buf, off + pidOff);
+                    off += rowSize;
+                    if (port <= 0 || pid <= 0) continue;
+                    ports.Add(port);
+                    if (!pidByPort.TryGetValue(port, out var list)) { list = new List<int>(); pidByPort[port] = list; }
+                    if (!list.Contains(pid)) list.Add(pid);
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+        return (ports, pidByPort);
+    }
+
+    // 实例对应的进程：web + 网关端口的所有者 PID 并集
+    private static List<int> PidsFor(InstanceConfig inst, Dictionary<int, List<int>> pidByPort)
+    {
+        var pids = new List<int>();
+        foreach (var p in new[] { PortOf(inst.WebUrl), inst.GatewayUrl != null ? PortOf(inst.GatewayUrl) : -1 })
+        {
+            if (p <= 0 || !pidByPort.TryGetValue(p, out var owners)) continue;
+            foreach (var pid in owners) if (!pids.Contains(pid)) pids.Add(pid);
+        }
+        return pids;
+    }
+
+    private static bool IsNodeProcess(int pid)
+    {
+        try { using var p = Process.GetProcessById(pid); return string.Equals(p.ProcessName, "node", StringComparison.OrdinalIgnoreCase); }
+        catch { return false; }
+    }
+
+    // 后台刷新：原生端口表（毫秒级），锁外查询、锁内赋值
     private static void RefreshCache()
     {
         try
         {
-            var ports = new HashSet<int>();
-            try
-            {
-                using var searcher = new ManagementObjectSearcher(@"root\standardcimv2",
-                    "SELECT LocalPort FROM MSFT_NetTCPConnection WHERE State=2");
-                foreach (var o in searcher.Get())
-                {
-                    if (o["LocalPort"] != null)
-                        ports.Add(Convert.ToInt32(o["LocalPort"]));
-                }
-            }
-            catch (Exception ex) { Log($"listen-port query failed: {ex.Message}"); }
-
+            var (ports, pidByPort) = GetTcpListeners();
             var snap = new Dictionary<string, (bool webUp, bool gwUp, List<int> pids)>();
             foreach (var inst in _instances)
             {
                 int wp = PortOf(inst.WebUrl);
                 bool webUp = wp > 0 && ports.Contains(wp);
                 bool gwUp = inst.GatewayUrl != null && ports.Contains(PortOf(inst.GatewayUrl!));
-                snap[inst.Profile] = (webUp, gwUp, ProfilePids(inst.Profile, wp)); // 锁外查询
+                snap[inst.Profile] = (webUp, gwUp, PidsFor(inst, pidByPort));
             }
-
-            lock (CacheLock)
-            {
-                _listeningPorts = ports;
-                foreach (var kv in snap) StateCache[kv.Key] = kv.Value;
-            }
+            lock (CacheLock) { foreach (var kv in snap) StateCache[kv.Key] = kv.Value; }
         }
         catch (Exception ex) { Log($"refresh cache failed: {ex.Message}"); }
     }
@@ -170,39 +213,6 @@ internal static class Program
         lock (CacheLock)
             if (StateCache.TryGetValue(inst.Profile, out var s)) return s;
         return (false, false, new List<int>());
-    }
-
-    private static List<int> ProfilePids(string profile, int webPort)
-    {
-        var pids = new List<int>();
-        try
-        {
-            // 通道 1：命令行精确匹配（管理员可读时优先，见 test 用例）
-            var pattern = $@"--profile(?:=|\s+)['""]?{Regex.Escape(profile)}['""]?(?=\s|$)";
-            using var searcher = new ManagementObjectSearcher(
-                $"SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='node.exe'");
-            foreach (var obj in searcher.Get())
-            {
-                var cl = obj["CommandLine"] as string;
-                if (cl != null && Regex.IsMatch(cl, pattern))
-                    pids.Add(Convert.ToInt32(obj["ProcessId"]));
-            }
-            if (pids.Count > 0) return pids;
-
-            // 通道 2：web 端口反查 PID（命令行不可读时的兜底——实测管理员也读不到部分进程命令行）
-            if (webPort > 0)
-            {
-                using var conn = new ManagementObjectSearcher(@"root\standardcimv2",
-                    $"SELECT OwningProcess FROM MSFT_NetTCPConnection WHERE LocalPort={webPort} AND State=2");
-                foreach (var obj in conn.Get())
-                {
-                    var pid = Convert.ToInt32(obj["OwningProcess"]);
-                    if (pid > 0 && !pids.Contains(pid)) pids.Add(pid);
-                }
-            }
-        }
-        catch (Exception ex) { Log($"pid query failed: {ex.Message}"); }
-        return pids;
     }
 
     private static (bool webUp, bool gwUp) StateOf(InstanceConfig inst)
@@ -215,20 +225,31 @@ internal static class Program
 
     private static void StartInstance(InstanceConfig inst)
     {
-        if (CachedState(inst).pids.Count > 0)
+        // 实时探测（原生端口表毫秒级）：不再读可能过期的缓存——重启/停止后立即启动也能拿到最新状态
+        var (livePorts, pidByPort) = GetTcpListeners();
+        var livePids = PidsFor(inst, pidByPort);
+        if (livePids.Count > 0)
         {
-            _tray?.ShowBalloonTip(3000, "dsh-tray", $"{inst.Name} 已在运行", ToolTipIcon.Info);
+            bool allNode = livePids.All(IsNodeProcess);
+            if (allNode)
+                _tray?.ShowBalloonTip(3000, "dsh-tray", $"{inst.Name} 已在运行", ToolTipIcon.Info);
+            else
+            {
+                var msg = $"{inst.Name} 未启动：端口已被其它程序占用（进程 {string.Join(",", livePids)}）。";
+                _tray?.ShowBalloonTip(5000, "dsh-tray", msg, ToolTipIcon.Warning);
+                Log($"start {inst.Profile} skipped: ports owned by non-node process ({string.Join(",", livePids)})");
+            }
             return;
         }
 
-        // 启动前检查端口占用：占用了再启动只会 EADDRINUSE 静默失败（读缓存，秒回）
+        // 端口占用兜底检查（端口在监听必有 owner pid，此处覆盖 pid 解析不到的边界）
         var occupied = new List<string>();
         int webPort = PortOf(inst.WebUrl);
-        if (webPort > 0 && PortInCache(webPort)) occupied.Add($"web:{webPort}");
+        if (webPort > 0 && livePorts.Contains(webPort)) occupied.Add($"web:{webPort}");
         if (inst.GatewayUrl != null)
         {
             int gwPort = PortOf(inst.GatewayUrl);
-            if (gwPort > 0 && PortInCache(gwPort)) occupied.Add($"网关:{gwPort}");
+            if (gwPort > 0 && livePorts.Contains(gwPort)) occupied.Add($"网关:{gwPort}");
         }
         if (occupied.Count > 0)
         {
@@ -259,7 +280,7 @@ internal static class Program
                 proc.BeginErrorReadLine();
                 StartedByUs[inst.Profile] = true;
                 Log($"started {inst.Profile}");
-                ThreadPool.QueueUserWorkItem(_ => RefreshCache()); // 立即刷新状态，不等后台定时器
+                RefreshCache(); // 立即刷新状态（毫秒级），不等后台定时器
             }
         }
         catch (Exception ex)
@@ -273,12 +294,11 @@ internal static class Program
 
     private static void StopInstance(InstanceConfig inst)
     {
-        var pids = CachedState(inst).pids;
-        if (pids.Count == 0)
-            pids = ProfilePids(inst.Profile, PortOf(inst.WebUrl)); // 缓存未刷新时实时兜底（双通道）
+        var (_, pidByPort) = GetTcpListeners();
+        var pids = PidsFor(inst, pidByPort); // 实时端口表：杀的就是当前监听这两个端口的进程
         if (pids.Count == 0)
         {
-            _tray?.ShowBalloonTip(3000, "dsh-tray", $"{inst.Name}：未找到该实例的进程（web 端口无监听，或进程查询失败）", ToolTipIcon.Warning);
+            _tray?.ShowBalloonTip(3000, "dsh-tray", $"{inst.Name}：未找到该实例的进程（web 端口无监听）", ToolTipIcon.Warning);
             Log($"stop {inst.Profile}: no matching node process found");
             StartedByUs[inst.Profile] = false;
             return;
@@ -306,21 +326,25 @@ internal static class Program
         StartedByUs[inst.Profile] = false;
         _tray?.ShowBalloonTip(3000, "dsh-tray", $"{inst.Name} 已停止（{pids.Count} 个进程树）", ToolTipIcon.Info);
         Log($"stopped {inst.Profile}: {pids.Count} process tree(s)");
-        ThreadPool.QueueUserWorkItem(_ => RefreshCache()); // 停止后立即刷新状态
+        RefreshCache(); // 立即刷新状态（毫秒级）
     }
 
-    // 等待端口释放（强杀后端口可能延迟释放），超时返回 false
-    // 在 UI 线程上轮询，需泵消息避免托盘冻结
-    private static bool WaitPortFree(int port, int timeoutMs)
+    // 等待端口释放（强杀后端口可能延迟释放），超时返回 false；在 UI 线程上轮询，需泵消息避免托盘冻结
+    private static bool WaitPortsFree(IReadOnlyList<int> ports, int timeoutMs)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
-            if (!PortListening(port)) return true;
+            bool busy = false;
+            foreach (var port in ports)
+                if (port > 0 && PortListening(port)) { busy = true; break; }
+            if (!busy) return true;
             Application.DoEvents();
             Thread.Sleep(500);
         }
-        return !PortListening(port);
+        foreach (var port in ports)
+            if (port > 0 && PortListening(port)) return false;
+        return true;
     }
 
     // ── menu ────────────────────────────────────────────────────────────────
@@ -328,6 +352,8 @@ internal static class Program
     private static ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip { ShowImageMargin = false };
+        menu.Opening += (_, _) => _menuOpen = true;
+        menu.Closed += (_, _) => _menuOpen = false;
         var first = true;
         foreach (var inst in _instances)
         {
@@ -367,9 +393,10 @@ internal static class Program
                 {
                     if (!Confirm($"重启 {inst.Name}？")) return;
                     StopInstance(inst);
-                    if (!WaitPortFree(PortOf(inst.WebUrl), 6000))
-                        Log($"restart {inst.Profile}: web port {PortOf(inst.WebUrl)} still busy after stop");
-                    StartInstance(inst);
+                    var ports = new[] { PortOf(inst.WebUrl), inst.GatewayUrl != null ? PortOf(inst.GatewayUrl) : -1 };
+                    if (!WaitPortsFree(ports, 6000))
+                        Log($"restart {inst.Profile}: ports still busy after stop");
+                    StartInstance(inst); // 启动前检查是实时的：端口/进程已释放即可立即起来
                 };
                 menu.Items.Add(restart);
 
@@ -413,6 +440,9 @@ internal static class Program
 
     // ── status refresh / crash detection ────────────────────────────────────
 
+    private static string MenuSig()
+        => string.Join("|", _instances.Select(i => $"{i.Profile}:{StateOf(i).webUp}:{StateOf(i).gwUp}"));
+
     private static void RefreshStates()
     {
         foreach (var inst in _instances)
@@ -431,6 +461,15 @@ internal static class Program
                 _tray?.ShowBalloonTip(5000, "dsh-tray", $"{inst.Name} 异常退出{tail}", ToolTipIcon.Warning);
             }
             LastState[inst.Profile] = webUp ? "up" : "down";
+        }
+
+        // 状态变化时自动重建菜单（展开中不打断，收起后下次 tick 即更新）——不用反复点击也能看到最新状态
+        if (_menuOpen) return;
+        var sig = MenuSig();
+        if (sig != _menuSig)
+        {
+            _menuSig = sig;
+            _tray!.ContextMenuStrip = BuildMenu();
         }
     }
 

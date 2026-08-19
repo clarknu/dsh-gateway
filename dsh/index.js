@@ -8,10 +8,11 @@
 // patches) consumed by the Settings-page card in ./client.js.
 
 import z from '@deepseek-ai/schemastery'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { connect } from 'node:net'
 import { createGateway } from '../lib/gateway-core.js'
 
 export const name = 'gateway'
@@ -67,16 +68,31 @@ export function apply(ctx, config = {}) {
   const dataDir = gatewayDataDir()
   const hmacSecret = loadHmacSecret(dataDir)
 
-  // Ring buffer for the panel's log view (and plain console output).
+  // Ring buffer for the panel's log view (and plain console output), plus a
+  // file mirror so the last lines survive a plugin re-apply or process crash.
   const logLines = []
+  const logFilePath = join(dataDir, 'gateway.log')
+  const persistLog = (line) => {
+    try {
+      writeFileSync(logFilePath, `${JSON.stringify(line)}\n`, { encoding: 'utf8', flag: 'a' })
+      if (statSync(logFilePath).size > 512 * 1024) {
+        const tail = readFileSync(logFilePath, 'utf8').split('\n').slice(-200).join('\n')
+        writeFileSync(logFilePath, tail, { encoding: 'utf8' })
+      }
+    } catch {
+      // logging must never throw
+    }
+  }
   const pushLog = (level, msg) => {
     const line = { t: new Date().toISOString(), level, msg: String(msg) }
     logLines.push(line)
     if (logLines.length > 200) logLines.shift()
+    persistLog(line)
     ;(level === 'warn' ? console.error : console.log)(msg)
   }
   const log = (msg) => pushLog('info', msg)
   const warn = (msg) => pushLog('warn', msg)
+  log(`gateway plugin v${version} starting (pid ${process.pid})`)
 
   let settingsScope = null
   let current = null
@@ -84,8 +100,71 @@ export function apply(ctx, config = {}) {
   let rebuildChain = Promise.resolve()
   let startedAt = null
   let lastError = ''
+  let lastOnErrorAt = 0
 
   const resolvedConfig = () => (settingsScope ? settingsScope.get() : config)
+
+  // ── self-heal ─────────────────────────────────────────────────────────────
+  // The observed failure mode: the OS can silently drop the listening socket
+  // while the server object still thinks it is running — no 'error' event, no
+  // log, panel still says running. Every 60s we probe the bound port from
+  // loopback and force a rebuild if it stopped answering.
+  let healthTimer = null
+  let checking = false
+  const probePort = (host, port, timeoutMs = 800) =>
+    new Promise((resolve) => {
+      const socket = connect({ host, port })
+      let done = false
+      const timer = setTimeout(() => {
+        if (!done) {
+          done = true
+          socket.destroy()
+          resolve(false)
+        }
+      }, timeoutMs)
+      socket.once('connect', () => {
+        if (!done) {
+          done = true
+          socket.destroy()
+          resolve(true)
+        }
+      })
+      socket.once('error', () => {
+        if (!done) {
+          done = true
+          socket.destroy()
+          resolve(false)
+        }
+      })
+    })
+  const startHealthCheck = () => {
+    stopHealthCheck()
+    healthTimer = setInterval(() => {
+      void checkHealth()
+    }, 60000)
+    healthTimer.unref?.()
+  }
+  const stopHealthCheck = () => {
+    if (healthTimer) {
+      clearInterval(healthTimer)
+      healthTimer = null
+    }
+  }
+  const checkHealth = async () => {
+    const gw = current
+    if (!gw || typeof gw.port !== 'number' || checking) return
+    checking = true
+    try {
+      const host = currentOptions?.listenHost === '0.0.0.0' ? '127.0.0.1' : currentOptions?.listenHost ?? '127.0.0.1'
+      const ok = await probePort(host, gw.port)
+      if (!ok && current === gw) {
+        warn('gateway: health check failed — listener not responding, restarting')
+        await queueRebuild(true)
+      }
+    } finally {
+      checking = false
+    }
+  }
 
   /** The injected webServer service carries the real bound port. */
   const resolveUpstream = (cfg) => {
@@ -106,7 +185,12 @@ export function apply(ctx, config = {}) {
         const cfg = resolvedConfig()
         if (cfg.enabled === false) {
           if (current) log('gateway: disabled — listener stopped')
-          current?.stop()
+          stopHealthCheck()
+          try {
+            current?.stop()
+          } catch (error) {
+            warn(`gateway: error stopping listener — ${error.message ?? error}`)
+          }
           current = null
           currentOptions = null
           startedAt = null
@@ -128,6 +212,17 @@ export function apply(ctx, config = {}) {
           hmacSecret,
           log,
           warn,
+          // Listener-level errors after a successful bind: log + self-heal,
+          // throttled so a recurring OS-level failure cannot spin a rebuild loop.
+          onError: (error) => {
+            const now = Date.now()
+            if (now - lastOnErrorAt < 30000) {
+              warn('gateway: listener error recurring — suppressing auto-restart')
+              return
+            }
+            lastOnErrorAt = now
+            void queueRebuild(true)
+          },
         }
         if (current && !force) {
           // Two-tier hot reload: request-time fields mutate in place (no gap,
@@ -148,7 +243,12 @@ export function apply(ctx, config = {}) {
         // (panel restart / port change). Give the in-flight response a beat
         // to flush before closing the old server.
         if (current) await new Promise((resolve) => setTimeout(resolve, 120))
-        current?.stop()
+        stopHealthCheck()
+        try {
+          current?.stop()
+        } catch (error) {
+          warn(`gateway: error stopping previous listener — ${error.message ?? error}`)
+        }
         current = null
         currentOptions = null
         startedAt = null
@@ -160,7 +260,9 @@ export function apply(ctx, config = {}) {
           currentOptions = options
           startedAt = new Date().toISOString()
           bootWarnings(cfg, port)
+          startHealthCheck()
         } catch (error) {
+          stopHealthCheck()
           lastError = error.message ?? String(error)
           warn(`gateway: failed to apply configuration, gateway is down — ${lastError}`)
         }
@@ -290,7 +392,13 @@ export function apply(ctx, config = {}) {
   void queueRebuild()
 
   ctx.on('dispose', () => {
-    current?.stop()
+    stopHealthCheck()
+    if (current) log('gateway: plugin disposed — stopping listener')
+    try {
+      current?.stop()
+    } catch (error) {
+      warn(`gateway: error stopping listener on dispose — ${error.message ?? error}`)
+    }
     current = null
   })
 }
