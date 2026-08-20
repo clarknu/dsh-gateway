@@ -160,7 +160,7 @@ test('successful login issues an HttpOnly Secure session cookie that authorizes 
     assert.equal(api.status, 200)
     const json = JSON.parse(api.body)
     assert.equal(json.xfp, 'https')
-    assert.equal(json.host, 'localhost') // the client's Host is preserved, Caddy-style
+    assert.equal(json.host, 'localhost') // the client's Host is preserved (transparent proxy)
   })
 })
 
@@ -221,6 +221,19 @@ test('replacing the whole users table live (the plugin Object.assign path) appli
     const good = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=new-pass' })
     assert.equal(good.status, 302)
     assert.match(good.setCookies[0], /Max-Age=3888000/) // 45 days
+  })
+})
+
+test('scrypt-hashed credentials log in exactly like plaintext (storage upgrade)', async () => {
+  const { hashPassword } = await import('../lib/auth.js')
+  const users = { admin: hashPassword('secret-pass'), clark: 'other-pass' }
+  await withGateway({ users }, async ({ port }) => {
+    const viaScrypt = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=secret-pass' })
+    assert.equal(viaScrypt.status, 302)
+    const legacy = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=clark&password=other-pass' })
+    assert.equal(legacy.status, 302)
+    const wrong = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=wrong' })
+    assert.equal(wrong.status, 401)
   })
 })
 

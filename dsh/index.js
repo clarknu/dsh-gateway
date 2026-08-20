@@ -9,17 +9,18 @@
 
 import z from '@deepseek-ai/schemastery'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { connect } from 'node:net'
+import { request as httpsRequest } from 'node:https'
 import { createGateway } from '../lib/gateway-core.js'
+import { hashPassword, verifyPassword, SCRYPT_PREFIX } from '../lib/auth.js'
 
 export const name = 'gateway'
 
 export const Config = z.object({
   enabled: z.boolean().default(true),
-  listenHost: z.string().default('0.0.0.0'),
+  listenHost: z.string().default('127.0.0.1'),
   port: z.natural().min(1).max(65535).default(3443),
   upstream: z.string().default(''),
   cookieName: z.string().default('dsh_gw_sid'),
@@ -28,7 +29,7 @@ export const Config = z.object({
   loginFailLimit: z.natural().min(1).default(5),
   lockoutSeconds: z.natural().min(1).default(60),
   maxBodyBytes: z.natural().min(1024).default(16384),
-  users: z.dict(z.string().role('secret')).default({ admin: 'change-me' }),
+  users: z.dict(z.string().role('secret')).default({}),
   sites: z
     .array(
       z.object({
@@ -62,6 +63,24 @@ function loadHmacSecret(dataDir) {
   mkdirSync(dataDir, { recursive: true })
   writeFileSync(statePath, JSON.stringify({ hmacSecret: secret }, null, 2), { encoding: 'utf8', mode: 0o600 })
   return secret
+}
+
+/**
+ * Fail-closed gate. The published default credential pair (admin/change-me)
+ * ships in this repository in plain text, so it must never back a
+ * non-loopback listener: an unconfigured install has to mean "nobody can log
+ * in", not "everyone knows the password". Returns an error message when the
+ * resolved config would expose the web surface behind that credential, or
+ * null when the config is safe to apply.
+ */
+export function defaultCredsGuard(cfg) {
+  const users = cfg?.users ?? {}
+  const listenHost = String(cfg?.listenHost ?? '')
+  const loopbackOnly = /^(127\.0\.0\.1|::1|localhost)$/i.test(listenHost)
+  if (!loopbackOnly && users.admin !== undefined && verifyPassword('change-me', users.admin)) {
+    return 'refusing to apply: the published default credential admin/change-me is in effect on a non-loopback listener — set gateway.users to real credentials before exposing the gateway (see README "安全基线")'
+  }
+  return null
 }
 
 export function apply(ctx, config = {}) {
@@ -101,42 +120,97 @@ export function apply(ctx, config = {}) {
   let startedAt = null
   let lastError = ''
   let lastOnErrorAt = 0
+  let restarting = false
 
   const resolvedConfig = () => (settingsScope ? settingsScope.get() : config)
 
+  /**
+   * Reject a settings write whose resolved outcome would trip the fail-closed
+   * gate (published admin/change-me behind a non-loopback listener). Checking
+   * at write time — not only at rebuild time — keeps the stored document and
+   * the running listener from ever diverging, and hands the caller a real
+   * error instead of a silently skipped hot reload.
+   * @returns true when the write was refused (response already sent).
+   */
+  function rejectUnsafeWrite(res, patch, ops) {
+    const cfg = resolvedConfig()
+    const nextUsers = Object.assign({}, cfg.users ?? {})
+    if (patch && typeof patch.users === 'object' && patch.users !== null) {
+      for (const [username, value] of Object.entries(patch.users)) nextUsers[username] = value
+    }
+    if (Array.isArray(ops)) {
+      for (const op of ops) {
+        if (!op || !Array.isArray(op.path) || op.path.length !== 2 || op.path[0] !== 'users') continue
+        if (op.op === 'set') nextUsers[op.path[1]] = op.value
+        if (op.op === 'unset') delete nextUsers[op.path[1]]
+      }
+    }
+    const nextListenHost = patch && typeof patch.listenHost === 'string' ? patch.listenHost : cfg.listenHost
+    const error = defaultCredsGuard({ listenHost: nextListenHost, users: nextUsers })
+    if (!error) return false
+    res.writeHead(400)
+    res.end(JSON.stringify({ ok: false, error }))
+    return true
+  }
+
   // ── self-heal ─────────────────────────────────────────────────────────────
-  // The observed failure mode: the OS can silently drop the listening socket
-  // while the server object still thinks it is running — no 'error' event, no
-  // log, panel still says running. Every 60s we probe the bound port from
-  // loopback and force a rebuild if it stopped answering.
+  // The observed failure mode: a suspend/resume race (S0ix Modern Standby)
+  // can corrupt the listening socket while the server object still thinks it
+  // is running — no 'error' event, no log, panel still says running, and the
+  // port even stays TCP-connectable (the kernel completes the handshake from
+  // the accept backlog). A TCP probe cannot see this half-dead state. Every
+  // 60s we do a real HTTPS probe (TLS handshake + HTTP response) through the
+  // physical NIC path, and rebuild only after 3 consecutive failures so a
+  // transient blip never restarts a healthy gate.
   let healthTimer = null
   let checking = false
-  const probePort = (host, port, timeoutMs = 800) =>
+  let healthFails = 0
+  const HEALTH_FAIL_LIMIT = 3
+
+  /** First physical-NIC IPv4 (skip loopback/virtual/APIPA) — probes the real NIC path. */
+  const primaryIPv4 = () => {
+    try {
+      for (const [name, addrs] of Object.entries(networkInterfaces())) {
+        if (/^(lo|Loopback)/i.test(name)) continue
+        if (/vEthernet|virtual|hyper-v/i.test(name)) continue
+        for (const a of addrs ?? []) {
+          if (a.family !== 'IPv4' || a.internal) continue
+          if (a.address.startsWith('169.254.')) continue
+          return a.address
+        }
+      }
+    } catch {
+      // fall through to loopback
+    }
+    return null
+  }
+
+  /**
+   * HTTPS-level liveness probe: any HTTP status (2xx/3xx/4xx) counts as alive;
+   * only timeout / connection failure / hung TLS means dead. The Host header
+   * carries the probed address so the allow-list answers normally.
+   */
+  const probeHttps = (host, port, timeoutMs = 4000) =>
     new Promise((resolve) => {
-      const socket = connect({ host, port })
-      let done = false
-      const timer = setTimeout(() => {
-        if (!done) {
-          done = true
-          socket.destroy()
-          resolve(false)
-        }
-      }, timeoutMs)
-      socket.once('connect', () => {
-        if (!done) {
-          done = true
-          socket.destroy()
-          resolve(true)
-        }
-      })
-      socket.once('error', () => {
-        if (!done) {
-          done = true
-          socket.destroy()
-          resolve(false)
-        }
-      })
+      let settled = false
+      const done = (ok) => {
+        if (settled) return
+        settled = true
+        req.destroy()
+        resolve(ok)
+      }
+      const req = httpsRequest(
+        { host, port, path: '/', method: 'GET', rejectUnauthorized: false, timeout: timeoutMs, headers: { Host: host } },
+        (res) => {
+          res.resume()
+          done(true)
+        },
+      )
+      req.on('timeout', () => done(false))
+      req.on('error', () => done(false))
+      req.end()
     })
+
   const startHealthCheck = () => {
     stopHealthCheck()
     healthTimer = setInterval(() => {
@@ -155,11 +229,23 @@ export function apply(ctx, config = {}) {
     if (!gw || typeof gw.port !== 'number' || checking) return
     checking = true
     try {
-      const host = currentOptions?.listenHost === '0.0.0.0' ? '127.0.0.1' : currentOptions?.listenHost ?? '127.0.0.1'
-      const ok = await probePort(host, gw.port)
-      if (!ok && current === gw) {
-        warn('gateway: health check failed — listener not responding, restarting')
+      const host =
+        currentOptions?.listenHost === '0.0.0.0'
+          ? (primaryIPv4() ?? '127.0.0.1')
+          : (currentOptions?.listenHost ?? '127.0.0.1')
+      const ok = await probeHttps(host, gw.port)
+      if (current !== gw) return
+      if (ok) {
+        if (healthFails > 0) healthFails = 0
+        return
+      }
+      healthFails += 1
+      if (healthFails >= HEALTH_FAIL_LIMIT) {
+        healthFails = 0
+        warn(`gateway: HTTPS health check failed ${HEALTH_FAIL_LIMIT}x consecutively — listener not serving, restarting`)
         await queueRebuild(true)
+      } else {
+        warn(`gateway: HTTPS health check failed (${healthFails}/${HEALTH_FAIL_LIMIT}) — will retry`)
       }
     } finally {
       checking = false
@@ -185,6 +271,7 @@ export function apply(ctx, config = {}) {
         const cfg = resolvedConfig()
         if (cfg.enabled === false) {
           if (current) log('gateway: disabled — listener stopped')
+          restarting = false
           stopHealthCheck()
           try {
             current?.stop()
@@ -194,6 +281,30 @@ export function apply(ctx, config = {}) {
           current = null
           currentOptions = null
           startedAt = null
+          return
+        }
+        // Fail-closed gate: refuse to (re)start a non-loopback listener while
+        // the published default credential pair is in effect — a warning in a
+        // log is not a gate. A running listener survives a hot edit that trips
+        // the guard, but only with a loud warning.
+        const guardError = defaultCredsGuard(cfg)
+        if (guardError) {
+          restarting = false
+          if (current && !force) {
+            warn(`gateway: ${guardError} — kept the running listener; fix gateway.users before the next restart`)
+          } else {
+            stopHealthCheck()
+            try {
+              current?.stop()
+            } catch (error) {
+              warn(`gateway: error stopping listener — ${error.message ?? error}`)
+            }
+            current = null
+            currentOptions = null
+            startedAt = null
+            lastError = guardError
+            warn(`gateway: ${guardError}`)
+          }
           return
         }
         const options = {
@@ -233,6 +344,7 @@ export function apply(ctx, config = {}) {
             currentOptions.upstream !== options.upstream ||
             JSON.stringify(currentOptions.sites) !== JSON.stringify(options.sites)
           if (!restartNeeded) {
+            restarting = false
             Object.assign(currentOptions, options)
             currentOptions.sites = options.sites
             return
@@ -243,6 +355,7 @@ export function apply(ctx, config = {}) {
         // (panel restart / port change). Give the in-flight response a beat
         // to flush before closing the old server.
         if (current) await new Promise((resolve) => setTimeout(resolve, 120))
+        restarting = true
         stopHealthCheck()
         try {
           current?.stop()
@@ -259,9 +372,11 @@ export function apply(ctx, config = {}) {
           current = next
           currentOptions = options
           startedAt = new Date().toISOString()
+          restarting = false
           bootWarnings(cfg, port)
           startHealthCheck()
         } catch (error) {
+          restarting = false
           stopHealthCheck()
           lastError = error.message ?? String(error)
           warn(`gateway: failed to apply configuration, gateway is down — ${lastError}`)
@@ -275,8 +390,14 @@ export function apply(ctx, config = {}) {
     const users = cfg.users ?? {}
     if (Object.keys(users).length === 0) {
       warn('gateway: users is empty — nobody can log in (set gateway.users in settings.yaml)')
-    } else if (Object.keys(users).length === 1 && users.admin === 'change-me') {
-      warn('gateway: default credentials admin/change-me are in effect — change gateway.users NOW')
+    } else {
+      if (users.admin !== undefined && verifyPassword('change-me', users.admin)) {
+        warn('gateway: the published default credential admin/change-me is configured — set a real password (non-loopback listeners refuse to start with it)')
+      }
+      const plaintext = Object.entries(users).filter(([, v]) => typeof v === 'string' && !v.startsWith(SCRYPT_PREFIX))
+      if (plaintext.length > 0) {
+        warn(`gateway: ${plaintext.map(([u]) => u).join(', ')} password(s) stored as plaintext — regenerate with "node scripts/hash-password.mjs" (scrypt)`)
+      }
     }
     const hosts = (cfg.sites ?? []).flatMap((s) => s.hosts ?? [])
     if (hosts.length === 0 || (hosts.length === 1 && hosts[0] === 'localhost')) {
@@ -287,10 +408,12 @@ export function apply(ctx, config = {}) {
   // ── Settings-page panel route (consumed by ./client.js) ──────────────────
   const panelStatus = () => {
     const cfg = resolvedConfig()
+    const phase = cfg.enabled === false ? 'disabled' : restarting ? 'restarting' : current ? 'running' : lastError ? 'error' : 'stopped'
     return {
       version,
       enabled: cfg.enabled !== false,
       running: current !== null,
+      phase,
       startedAt,
       lastError,
       listenHost: cfg.listenHost,
@@ -348,9 +471,52 @@ export function apply(ctx, config = {}) {
                     res.writeHead(400)
                     return res.end(JSON.stringify({ ok: false, error: 'settings unavailable — edit settings.yaml directly' }))
                   }
+                  // Refuse writes that would land on the published credential
+                  // with a non-loopback listener (fail-closed gate).
+                  if (rejectUnsafeWrite(res, body.patch ?? {}, null)) return
                   // Persist + validate; the settings watch queues the rebuild
                   // (its listener swap waits 120ms, letting this reply flush).
                   await settingsScope.update(body.patch ?? {})
+                  res.writeHead(200)
+                  res.end(JSON.stringify({ ok: true, ...panelStatus() }))
+                  return
+                }
+                if (body.action === 'mutate') {
+                  // Path-addressed edits, the redacted-safe write path for
+                  // secret fields (users): the caller never restates passwords
+                  // it could not have seen. New plaintext passwords are hashed
+                  // server-side before persisting; scrypt values pass through.
+                  if (!settingsScope) {
+                    res.writeHead(400)
+                    return res.end(JSON.stringify({ ok: false, error: 'settings unavailable — edit settings.yaml directly' }))
+                  }
+                  let provider
+                  try {
+                    provider = ctx.get('settings')
+                  } catch {
+                    provider = null
+                  }
+                  if (!provider || typeof provider.mutate !== 'function') {
+                    res.writeHead(400)
+                    return res.end(JSON.stringify({ ok: false, error: 'settings provider unavailable — edit settings.yaml directly' }))
+                  }
+                  const ops = (Array.isArray(body.ops) ? body.ops : []).map((op) => {
+                    if (
+                      op &&
+                      op.op === 'set' &&
+                      Array.isArray(op.path) &&
+                      op.path.length === 2 &&
+                      op.path[0] === 'users' &&
+                      typeof op.value === 'string' &&
+                      !op.value.startsWith(SCRYPT_PREFIX)
+                    ) {
+                      return { ...op, value: hashPassword(op.value) }
+                    }
+                    return op
+                  })
+                  // Refuse the write when its outcome would trip the gate.
+                  if (rejectUnsafeWrite(res, null, ops)) return
+                  await provider.mutate('gateway', ops)
                   res.writeHead(200)
                   res.end(JSON.stringify({ ok: true, ...panelStatus() }))
                   return
