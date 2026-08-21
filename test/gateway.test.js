@@ -237,6 +237,23 @@ test('scrypt-hashed credentials log in exactly like plaintext (storage upgrade)'
   })
 })
 
+test('rotating the signing secret invalidates all live sessions (revoke-all-sessions)', async () => {
+  await withGateway({}, async ({ port, opts }) => {
+    const login = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=secret-pass' })
+    const cookie = cookieOf(login.setCookies)
+    assert.equal((await request(port, { path: '/', headers: { cookie } })).status, 200)
+    // The plugin's revoke-sessions action replaces currentOptions.hmacSecret
+    // (auth reads it live per request) — every prior cookie now fails.
+    opts.hmacSecret = 'rotated-secret-rotated-secret-rotated-32'
+    assert.equal((await request(port, { path: '/', headers: { cookie } })).status, 302)
+    // Logging in again under the rotated secret works.
+    const relogin = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=secret-pass' })
+    assert.equal(relogin.status, 302)
+    const fresh = cookieOf(relogin.setCookies)
+    assert.equal((await request(port, { path: '/', headers: { cookie: fresh } })).status, 200)
+  })
+})
+
 test('unknown Host header is refused with 421', async () => {
   await withGateway({}, async ({ port }) => {
     const res = await request(port, { host: 'evil.example.com', servername: 'evil.example.com', path: '/' })

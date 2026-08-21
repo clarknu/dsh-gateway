@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Config, defaultCredsGuard } from '../dsh/index.js'
-import { hashPassword, verifyPassword, SCRYPT_PREFIX } from '../lib/auth.js'
+import { createAuth, hashPassword, verifyPassword, SCRYPT_PREFIX } from '../lib/auth.js'
 
 test('schema defaults are fail-closed: loopback listener, no accounts', () => {
   const cfg = Config()
@@ -64,4 +64,20 @@ test('verifyPassword: scrypt round-trip, wrong password, malformed values', () =
 test('verifyPassword: legacy plaintext still verifies (backward compatibility)', () => {
   assert.equal(verifyPassword('secret-pass', 'secret-pass'), true)
   assert.equal(verifyPassword('other-pass', 'secret-pass'), false)
+})
+
+test('rotating the signing secret invalidates every issued cookie (revoke-all-sessions)', () => {
+  const options = {
+    users: { admin: 'pw' },
+    hmacSecret: 'secret-A-secret-A-secret-A-secret-A',
+  }
+  const auth = createAuth(options)
+  const cookie = auth.issueCookieHeader('admin').split(';')[0]
+  assert.equal(auth.verify(cookie), 'admin')
+  // The plugin's revoke-sessions action mutates options.hmacSecret live.
+  options.hmacSecret = 'secret-B-secret-B-secret-B-secret-B'
+  assert.equal(auth.verify(cookie), null)
+  // A newly issued cookie works under the rotated secret.
+  const fresh = auth.issueCookieHeader('admin').split(';')[0]
+  assert.equal(auth.verify(fresh), 'admin')
 })

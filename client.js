@@ -61,6 +61,10 @@ window.__ModuleLoader__.load({
       userRemoved: '账号已删除，已生效',
       confirmDeleteUser: '确定删除账号',
       accountsEmpty: '（无账号，无人可登录）',
+      revokeAll: '退出所有登录',
+      revokingAll: '正在使所有会话失效…',
+      revokedAll: '已使所有会话失效，所有客户端需重新登录',
+      confirmRevokeAll: '会使所有已登录设备立即退出，下次访问需重新输入用户名和密码。确定？',
       passwordNote: '密码保存时会在服务端以 scrypt 哈希存储，不落明文',
       logs: '网关日志',
       noLogs: '（暂无日志）',
@@ -115,6 +119,10 @@ window.__ModuleLoader__.load({
       userRemoved: 'Account removed and live',
       confirmDeleteUser: 'Remove account',
       accountsEmpty: '(no accounts — nobody can log in)',
+      revokeAll: 'Sign out all sessions',
+      revokingAll: 'Invalidating all sessions…',
+      revokedAll: 'All sessions invalidated — every client must log in again',
+      confirmRevokeAll: 'All logged-in devices will be signed out immediately and must log in again. Continue?',
       passwordNote: 'Passwords are stored as scrypt hashes server-side, never in plaintext',
       logs: 'Gateway logs',
       noLogs: '(no log lines yet)',
@@ -323,6 +331,16 @@ window.__ModuleLoader__.load({
             .then(function () { busyState[1](null); return load() })
         }
 
+        function revokeAll() {
+          if (!window.confirm(t.confirmRevokeAll)) return
+          busyState[1]('revoke')
+          setFeedback('busy', t.revokingAll)
+          post('revokeSessions')
+            .then(function () { setFeedback('ok', t.revokedAll) })
+            .catch(function (error) { setFeedback('err', t.failed + ': ' + String(error.message || error)) })
+            .then(function () { busyState[1](null); return load() })
+        }
+
         var summary = ''
         if (status) {
           if (status.phase === 'restarting') summary = t.restarting
@@ -348,9 +366,14 @@ window.__ModuleLoader__.load({
               h('div', { key: 'd0', style: { padding: '8px 0', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
                 h('button', { style: btn(true, disabled), disabled: disabled, onClick: toggle }, status.enabled ? t.disable : t.enable),
                 h('button', { style: btn(false, disabled), disabled: disabled, onClick: restart }, t.restart),
+                h('button', {
+                  style: Object.assign({}, btn(false, disabled), { color: '#d54941', borderColor: 'rgba(213,73,65,0.45)' }),
+                  disabled: disabled,
+                  onClick: revokeAll,
+                }, t.revokeAll),
                 busy
                   ? h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,0.8))' } },
-                    busy === 'restart' ? t.restarting : busy === 'toggle' ? (status.enabled ? t.disabling : t.enabling) : busy === 'listener' ? t.savingListener : busy === 'user' ? t.savingUser : t.removingUser)
+                    busy === 'restart' ? t.restarting : busy === 'toggle' ? (status.enabled ? t.disabling : t.enabling) : busy === 'listener' ? t.savingListener : busy === 'user' ? t.savingUser : busy === 'revoke' ? t.revokingAll : t.removingUser)
                   : null,
               ),
             )

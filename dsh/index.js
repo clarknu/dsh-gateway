@@ -66,6 +66,26 @@ function loadHmacSecret(dataDir) {
 }
 
 /**
+ * Rotate the session signing secret. Every previously issued cookie then
+ * fails signature verification immediately — the "revoke all sessions" /
+ * "log everyone out" action. The new secret is persisted to state.json so
+ * restarts keep the invalidation, and pushed into the live options object so
+ * the running gateway takes it without a listener restart.
+ */
+function rotateHmacSecret(dataDir, currentOptions, setSecret, log) {
+  const secret = randomBytes(32).toString('base64')
+  try {
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ hmacSecret: secret }, null, 2), { encoding: 'utf8', mode: 0o600 })
+  } catch (error) {
+    throw new Error(`failed to persist rotated session secret — ${error.message ?? error}`)
+  }
+  setSecret(secret)
+  if (currentOptions) currentOptions.hmacSecret = secret
+  log('gateway: session signing secret rotated — all existing sessions invalidated')
+}
+
+/**
  * Fail-closed gate. The published default credential pair (admin/change-me)
  * ships in this repository in plain text, so it must never back a
  * non-loopback listener: an unconfigured install has to mean "nobody can log
@@ -85,7 +105,7 @@ export function defaultCredsGuard(cfg) {
 
 export function apply(ctx, config = {}) {
   const dataDir = gatewayDataDir()
-  const hmacSecret = loadHmacSecret(dataDir)
+  let hmacSecret = loadHmacSecret(dataDir)
 
   // Ring buffer for the panel's log view (and plain console output), plus a
   // file mirror so the last lines survive a plugin re-apply or process crash.
@@ -464,6 +484,20 @@ export function apply(ctx, config = {}) {
                   res.writeHead(200)
                   res.end(JSON.stringify({ ok: true, action: 'restart', ...panelStatus() }))
                   setTimeout(() => void queueRebuild(true), 50)
+                  return
+                }
+                if (body.action === 'revokeSessions') {
+                  // "Log everyone out": rotate the signing secret so every
+                  // previously issued cookie fails verification immediately.
+                  // Takes effect live — no listener restart, no downtime.
+                  try {
+                    rotateHmacSecret(dataDir, currentOptions, (s) => { hmacSecret = s }, log)
+                    res.writeHead(200)
+                    res.end(JSON.stringify({ ok: true, action: 'revokeSessions', ...panelStatus() }))
+                  } catch (error) {
+                    res.writeHead(400)
+                    res.end(JSON.stringify({ ok: false, error: error.message ?? String(error) }))
+                  }
                   return
                 }
                 if (body.action === 'update') {
