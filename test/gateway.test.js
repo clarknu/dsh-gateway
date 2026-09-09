@@ -387,6 +387,49 @@ test('SNI serves each site its own certificate', async () => {
   }
 })
 
+test('upstream cookies are made browser-compatible through the gateway (Secure + SameSite=Lax)', async () => {
+  // The dsh web issues its token cookie as SameSite=Strict without Secure; a
+  // reverse proxy + stricter browsers can drop it, causing a 401 auth loop.
+  const upstream = createHttpServer((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'text/plain',
+      'set-cookie': 'dsh_web_sid=v1.abc; Path=/; HttpOnly; SameSite=Strict',
+    })
+    res.end('ok')
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  const upstreamPort = upstream.address().port
+  const certsDir = mkdtempSync(join(tmpdir(), 'dshgw-cookie-'))
+  const gateway = createGateway({
+    listenHost: '127.0.0.1',
+    port: 0,
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    users: { admin: 'x' },
+    sites: [{ hosts: ['localhost'] }],
+    certsDir,
+    hmacSecret: 'test-secret-test-secret-test-secret-32',
+    log: noLog,
+    warn: noLog,
+  })
+  const port = await gateway.start()
+  try {
+    const login = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'username=admin&password=x' })
+    const cookie = cookieOf(login.setCookies)
+    const res = await request(port, { path: '/', headers: { cookie } })
+    assert.equal(res.status, 200)
+    assert.equal(res.body, 'ok')
+    const sc = res.headers['set-cookie']
+    assert.ok(sc, 'expected the upstream set-cookie to be passed through')
+    const value = Array.isArray(sc) ? sc[0] : sc
+    assert.match(value, /SameSite=Lax/i)
+    assert.doesNotMatch(value, /SameSite=Strict/i)
+    assert.match(value, /;\s*Secure\b/i)
+  } finally {
+    gateway.stop()
+    upstream.close()
+  }
+})
+
 test('a configured certificate pair is loaded from disk', async () => {
   const { writeFileSync } = await import('node:fs')
   const pems = selfsigned.generate([{ name: 'commonName', value: 'wan.example.net' }], { days: 30, keySize: 2048 })
