@@ -285,6 +285,29 @@ export function apply(ctx, config = {}) {
     return 'http://127.0.0.1:3080'
   }
 
+  /**
+   * This process's DSH launch token — the one the web app prints at startup as
+   * `dsh web: http://127.0.0.1:3080/?token=…`. The gateway needs it to finish
+   * the browser's dsh session handshake on the user's behalf, because the token
+   * lives only inside this process (stdout / tray log) and a remote device can
+   * never obtain it.
+   *
+   * Resolved live on every call — never cached — so a web-app restart or a
+   * plugin hot reload is picked up without touching the gateway. Any failure
+   * (service not registered, malformed upstream, missing token) degrades to
+   * null and the proxy keeps its previous pass-through behaviour.
+   */
+  const resolveWebToken = () => {
+    try {
+      const connection = ctx.get('connection')
+      if (!connection || typeof connection.authenticatedUrl !== 'function') return null
+      const url = new URL(connection.authenticatedUrl(resolveUpstream(resolvedConfig())))
+      return url.searchParams.get('token')
+    } catch {
+      return null
+    }
+  }
+
   const queueRebuild = (force = false) => {
     rebuildChain = rebuildChain
       .then(async () => {
@@ -341,6 +364,7 @@ export function apply(ctx, config = {}) {
           lockoutSeconds: cfg.lockoutSeconds,
           maxBodyBytes: cfg.maxBodyBytes,
           hmacSecret,
+          resolveWebToken,
           log,
           warn,
           // Listener-level errors after a successful bind: log + self-heal,

@@ -112,6 +112,13 @@ gateway:
 - 上游返回的绝对 `Location` 头会自动改写回客户端的公开地址（`https://<clientHost>/...`）
 - WebSocket 升级走同一转发逻辑，无需额外配置
 - `sec-fetch-site: cross-site` 的跨站请求仍被上游拒绝，CSRF 防护不受影响
+- **DSH 进程 token 中继（自动建立会话）**：远程浏览器登录网关后，若上游对**文档请求**
+  返回 401（浏览器还没有 DSH 的 `dsh-auth-*` 会话 cookie），网关会用**本进程的 DSH 启动
+  token** 回一次 `302 /?token=<token>`，让浏览器无感完成 DSH 会话建立——否则远程设备拿不到
+  只存在于 web 进程 stdout / 托盘日志里的进程 token，只能停在 401 页。中继严格限定为
+  GET + 文档导航 + URL 未带 `token` 参数，并下发一枚 60 秒标记 cookie `dsh_gw_relay`：
+  若 token 已过期（web 进程重启过），交换会再次 401，标记 cookie 保证**只跳这一次、绝不循环**。
+  非文档请求（fetch/XHR/资源）的 401 一律原样透传。**此改动需重启 `dsh web` 进程后生效。**
 
 ## Windows 托盘启动器（可选）
 
