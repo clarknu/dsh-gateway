@@ -1,6 +1,6 @@
 {
   "name": "dsh-gateway",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "HTTPS + login gateway for the DeepSeek Harness web surface: securely access your DSH Web UI from another machine on your LAN, or from the internet via port forwarding. Fail-closed defaults (loopback-only listener, no accounts until configured); setup and security notes in the README.",
   "type": "module",
   "main": "dsh/index.js",
